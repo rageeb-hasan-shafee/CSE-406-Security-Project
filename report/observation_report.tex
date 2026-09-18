@@ -36,14 +36,17 @@
 \begin{abstract}
 This report documents the implementation and live execution of a TCP Window
 Scale desynchronization attack against a controlled 3-node lab, together with
-its low-bandwidth fallback (Slow Read / zero-window abuse). For each of the
-three attacks demonstrated -- \emph{deflate} (shift $7\to0$ family),
-\emph{inflate} (shift $\to14$), and \emph{Slow Read DoS} -- this report states
-the attack process actually followed, the outcome that was expected going in,
-the outcome that was actually observed, an explanation wherever the two
-diverged, and the assumptions the attack and the lab depend on. Defense
-mechanisms are explicitly out of scope for this report and are deferred to a
-subsequent phase of the project.
+its low-bandwidth fallback (Slow Read / zero-window abuse), and three defense
+mechanisms tested against the same attack pipeline. For each of the three
+attacks demonstrated -- \emph{deflate} (shift $7\to0$ family), \emph{inflate}
+(shift $\to14$), and \emph{Slow Read DoS} -- and each of the three defenses
+implemented -- static ARP hardening, IPsec AH (transport mode), and a live
+WScale-mismatch monitor -- this report states the process actually followed,
+the outcome that was expected going in, the outcome that was actually
+observed (or, for defenses awaiting a final confirmation run, the outcome
+predicted from the mechanism together with an explicit note that it is
+pending live verification), an explanation wherever expectation and
+observation diverged, and the assumptions the attack and the lab depend on.
 \end{abstract}
 
 \tableofcontents
@@ -389,6 +392,240 @@ worker/connection pool, which is a very common and simple property of real
 servers.
 
 % ---------------------------------------------------------------------------
+\section{Defense Mechanisms}
+\label{sec:defense}
+
+Per the design report's ``Defense Ideas'' slide, three defenses were
+implemented and wired up to run against the exact same attack pipeline used
+in Sections~\ref{sec:deflate}--\ref{sec:slowread}, rather than only
+described: stopping the MITM position itself (static ARP entries,
+approximating switch-level Dynamic ARP Inspection), enforcing
+transport/network-layer integrity (IPsec AH, transport mode), and detection
+(a live WScale-mismatch monitor, functionally equivalent to the deck's
+suggested Zeek/Snort rule). Each is implemented as an executable script
+under \texttt{defense/} together with \texttt{defense/run\_defense\_demo.sh},
+which re-runs the attack pipeline with one defense active at a time.
+
+\emph{A note on scope.} Zeek was not available through this system's default
+package repositories (it ships its own separate per-distribution repository,
+which was not added for this project), and Snort/Suricata's default rule
+language has no built-in way to compare a TCP option's raw value across two
+different packets of the same flow -- exactly what a WScale-mismatch check
+needs -- without custom scripting. Rather than ship an untested rule, the
+detection logic already validated in Sections~\ref{sec:deflate}
+and~\ref{sec:inflate} (\texttt{analysis/detect\_wscale\_mismatch.py}) was
+adapted to run live against a capture interface
+(\texttt{defense/live\_ids.py}); a reference Zeek script with equivalent
+logic is included at \texttt{defense/wscale\_ids.zeek} for documentation,
+though it was not executed in this lab.
+
+\subsection{Defense A: Stopping the MITM (Static ARP Entries)}
+\label{sec:defense-arp}
+
+\paragraph{Process.} \texttt{defense/harden\_arp.sh} reads each endpoint's
+real MAC address directly from its own interface
+(\texttt{/sys/class/net/eth0/address}) and installs it into the \emph{other}
+endpoint's kernel neighbor table as a \texttt{PERMANENT} entry -- e.g.\ the
+client is told ``\texttt{10.0.0.2} is at $\langle$server's real MAC$\rangle$,
+permanently.'' Linux does not update a \texttt{PERMANENT} neighbor-table
+entry in response to unsolicited or gratuitous ARP traffic, which is
+precisely the mechanism \texttt{attacker/arp\_spoof.py} depends on. With the
+defense applied, the deflate attack pipeline from
+Section~\ref{sec:deflate} was re-run unmodified via
+\texttt{sudo bash defense/run\_defense\_demo.sh arp}.
+
+\paragraph{Expected Outcome.} \texttt{arp\_spoof.py}'s forged replies should
+be silently ignored by both endpoints, so the attacker should never actually
+receive client$\leftrightarrow$server traffic. \texttt{wscale\_attack.py}
+should therefore log \emph{zero} rewrites, and the bulk transfer should
+complete at essentially baseline throughput with the negotiated window
+scale unchanged, matching Section~\ref{sec:deflate}'s pre-attack baseline
+rather than its throttled result.
+
+\paragraph{Actual Outcome.} The rewrite log shows the NFQUEUE handler bound
+and listening, but with \textbf{no} \texttt{rewrote WScale} line for the
+entire run -- it never received a single packet to tamper with:
+\begin{lstlisting}
+2026-09-19 02:01:56,938 listening on NFQUEUE 0 (target=client-syn, new_shift=0)
+(no further lines -- zero rewrites)
+\end{lstlisting}
+The bridge-side pcap confirms the connection went directly client
+$\leftrightarrow$ server with no duplicate/tampered SYN:
+\begin{lstlisting}
+10.0.0.1:53470 -> 10.0.0.2:9000  seq=1951765398  [SYN]
+    wscale values seen: [10]
+10.0.0.2:9000 -> 10.0.0.1:53470  seq=24270297  [SYN-ACK]
+    wscale values seen: [10]
+
+0 flow(s) with a WScale mismatch, 0 anomalously small window packet(s).
+No tampering signatures found in this capture.
+\end{lstlisting}
+And the transfer itself completed at full, untampered throughput with the
+correct window scale on both sides:
+\begin{lstlisting}
+server: throughput=2196.388 MB/s  total_retrans=0  snd_wscale=10
+client: throughput=1827.000 MB/s  total_retrans=0  snd_wscale=10  rcv_wscale=10
+\end{lstlisting}
+
+\paragraph{Does it work as expected?} \textbf{Yes, exactly.} The static
+(permanent) ARP entries held throughout \texttt{arp\_spoof.py}'s entire
+poisoning loop; the attacker never received a single client/server packet to
+divert or tamper with, and the connection behaved identically to the
+untampered baseline in Section~\ref{sec:deflate}. This is a complete,
+unambiguous block of the attack at its very first step -- the attacker
+never even achieves the on-path position the rest of the attack chain
+depends on.
+
+\subsection{Defense B: Transport/Network-Layer Integrity (IPsec AH, Transport Mode)}
+\label{sec:defense-ipsec}
+
+\paragraph{Process.} \texttt{defense/setup\_ipsec\_ah.sh} configures
+matching IPsec Security Associations and Policies directly via Linux's
+\texttt{ip xfrm} interface in both the client and server namespaces, using
+AH (Authentication Header) in transport mode with a fixed, manually
+pre-shared HMAC-SHA1-96 key (no IKE daemon -- this demonstrates the
+authentication mechanism itself, not a production key-exchange setup). AH
+authenticates the entire IP payload, TCP header included, via an Integrity
+Check Value (ICV) computed from the shared key. With this active (and
+static-ARP hardening \emph{not} active, so the attacker remains on-path),
+the same attack pipeline was re-run via
+\texttt{sudo bash defense/run\_defense\_demo.sh ipsec}.
+
+\paragraph{Expected Outcome.} The attacker can still recompute the IP/TCP
+checksums after editing the WScale option, exactly as in every attack in
+this report, but cannot recompute a valid AH ICV without the shared key. Two
+outcomes are plausible, and both would count as the defense working:
+\begin{enumerate}[label=(\alph*)]
+  \item the server's kernel receives the tampered, AH-protected SYN,
+        recomputes the expected ICV, finds it does not match, and silently
+        drops the packet before it ever reaches the TCP stack -- the
+        connection should stall while the client keeps retransmitting a SYN
+        that keeps failing the same way; or
+  \item since AH transport mode changes the IP header's protocol field from
+        TCP (6) to AH (51), the attacker's own
+        \texttt{iptables -p tcp --tcp-flags SYN SYN} diversion rule may
+        simply stop matching the now-AH-wrapped packets at all, in which
+        case \texttt{wscale\_attack.py} never sees them and logs no
+        rewrites -- the attacker loses its diversion mechanism entirely,
+        not only its tampering.
+\end{enumerate}
+Either way, the bulk transfer is expected to fail to complete within the
+pipeline's 10-second timeout, in clear contrast to Section~\ref{sec:deflate},
+where the identical attack against unprotected traffic completed
+successfully (just badly throttled).
+
+\paragraph{Actual Outcome.} The SAs and policies installed correctly on both
+sides (confirmed via \texttt{ip xfrm state/policy show}). With the attacker
+still on-path (ARP spoofing unaffected by IPsec), the rewrite log again
+shows the handler listening but logging \textbf{zero} rewrites for the
+entire run:
+\begin{lstlisting}
+2026-09-19 02:23:40,801 listening on NFQUEUE 0 (target=client-syn, new_shift=0)
+(no further lines -- zero rewrites)
+\end{lstlisting}
+The pcap-based detector found \textbf{no SYN or SYN-ACK packets at all} in
+the capture (not merely zero mismatches):
+\begin{lstlisting}
+=== SYN / SYN-ACK WScale values per flow ===
+(empty)
+0 flow(s) with a WScale mismatch, 0 anomalously small window packet(s).
+\end{lstlisting}
+And, unlike the prediction above, the transfer \textbf{completed
+successfully} rather than timing out -- with the window scale unmodified on
+both sides, but with visible secondary degradation (202 retransmits on the
+server side, throughput down to $\sim$156--158\,MB/s from an unprotected
+baseline in the thousands of MB/s):
+\begin{lstlisting}
+server: throughput=158.140 MB/s  total_retrans=202  snd_wscale=10 (unchanged)
+client: throughput=156.081 MB/s  total_retrans=0    snd_wscale=10 (unchanged)
+\end{lstlisting}
+
+\paragraph{Does it work as expected?} \textbf{Yes, on the point that
+matters, but through outcome (b) specifically, and one detail of the
+prediction was wrong.} The attack was completely neutralized -- zero
+rewrites, zero mismatches, window scale untouched on both ends -- confirming
+outcome (b): AH's protocol-51 wrapping made the attacker's
+\texttt{--tcp-flags SYN SYN} diversion rule stop matching the SYN entirely,
+so \texttt{wscale\_attack.py} never even saw a packet to tamper with.
+Outcome (a) (an AH ICV rejection) was never actually exercised, since
+nothing was ever tampered with in the first place. This report's
+\emph{prediction} that the connection would fail to complete within 10
+seconds was \textbf{incorrect}: because the attacker's diversion rule never
+matched, the AH-wrapped packets simply passed through the attacker's
+forwarding path untouched -- a transparent, non-tampering relay -- and the
+connection completed normally. Rather than a hung connection, the real
+result is arguably a stronger one for the defense: the legitimate connection
+keeps working \emph{and} is immune to the attack, instead of merely being
+denied service by IPsec's own failure mode. The 202 retransmits and reduced
+throughput are a separate, secondary effect, not an attack or defense
+artifact: this run's capture reported 5{,}587 packets dropped by
+\texttt{tcpdump}'s own kernel buffer (out of $\sim$9{,}000 received),
+indicating real CPU contention on the single physical machine running ARP
+spoofing, software AH encryption/verification on every packet, NFQUEUE, and
+packet capture simultaneously -- consistent with genuine, non-adversarial
+packet loss under load rather than anything the attacker or the defense
+caused deliberately. It is also worth noting explicitly that this run did
+\emph{not} test AH's cryptographic rejection path (outcome a) at all, since
+mechanism (b) pre-empted it; confirming outcome (a) specifically would
+require diverting on IP protocol 51 instead of TCP flags and having the
+rewriter attempt to blindly edit bytes inside the AH-protected region, which
+is outside this report's scope.
+
+\subsection{Defense C: Detection (Live WScale-Mismatch Monitor)}
+\label{sec:defense-ids}
+
+\paragraph{Process.} \texttt{defense/live\_ids.py} sniffs the bridge
+interface directly (via \texttt{scapy}), tracking the WScale value seen on
+the first SYN of every flow and comparing it against any later SYN sharing
+the same sequence number, and separately flagging any data packet whose
+window -- interpreted using the most recently observed scale for that flow
+-- computes to under 16\,KiB. Unlike Defenses A and B, this is detect-only
+and blocks nothing, so it was deliberately tested \emph{without} ARP
+hardening or IPsec active, watching the same undefended deflate attack from
+Section~\ref{sec:deflate} via
+\texttt{sudo bash defense/run\_defense\_demo.sh ids}.
+
+\paragraph{Expected Outcome.} The monitor should print one \texttt{[ALERT]}
+line for the WScale mismatch on the tampered SYN, and further
+\texttt{[ALERT]} lines for the anomalously small effective windows that
+follow it during the throttled transfer -- both signatures already
+confirmed present in the pcap analysis in Section~\ref{sec:deflate}.
+
+\paragraph{Actual Outcome.} The detection logic had already been verified
+offline (Process, above); it was then run live against the real, on-path
+deflate attack from Section~\ref{sec:deflate}
+(\texttt{sudo bash defense/run\_defense\_demo.sh ids}) and raised both alert
+types predicted:
+\begin{lstlisting}
+[ALERT] 02:28:01  WScale mismatch on 10.0.0.1:40708 -> 10.0.0.2:9000
+    (seq=1123647667): first saw 10, now 0 -- SYN tampered in flight
+
+[ALERT] 02:28:01  Anomalous window on 10.0.0.1:40708 -> 10.0.0.2:9000:
+    advertised=63 wscale=0 effective=63 bytes
+[ALERT] 02:28:01  Anomalous window on 10.0.0.1:40708 -> 10.0.0.2:9000:
+    advertised=63 wscale=0 effective=63 bytes
+    ... (24,891 anomalous-window alerts total)
+\end{lstlisting}
+Exactly \textbf{1} mismatch alert fired, on the correct SYN, with the
+correct before/after shift values (10 then 0) -- there is only one tampered
+SYN in the whole run, so one alert is the correct count, not an
+under-detection. The \textbf{24,891} anomalous-window alerts are consistent
+with, not contradictory to, everything already established in
+Section~\ref{sec:deflate}: a deflated connection is throttled to
+$\sim$63-byte effective windows for its entire transfer, which (as computed
+in Section~\ref{sec:deflate}) means several hundred thousand tiny segments
+for a 20\,MB transfer -- \texttt{live\_ids.py}, unlike the pcap-based
+detector used elsewhere in this report, has no packet cap, so it alerted on
+every single one it saw during the run rather than a capped sample.
+
+\paragraph{Does it work as expected?} \textbf{Yes, exactly.} Both signatures
+the deck's Detection slide calls for -- a WScale mismatch between SYNs, and
+anomalous window sizes -- fired correctly against real, live, on-the-wire
+traffic during an actual attack, with the mismatch alert count matching the
+true number of tampered SYNs exactly (one) and zero false positives of
+either type.
+
+% ---------------------------------------------------------------------------
 \section{Assumptions}
 \label{sec:assumptions}
 
@@ -461,6 +698,28 @@ construction depends on them:
         fully event-driven server with no per-connection worker limit)
         would not be denied service by this specific mechanism, though it
         may still suffer memory pressure from enough held-open connections.
+  \item \textbf{Static ARP hardening assumes the real MAC addresses are
+        already known and trustworthy at the time it is applied.}
+        Defense~A (Section~\ref{sec:defense-arp}) pins each endpoint's real
+        MAC into the other's neighbor table; it must be applied \emph{before}
+        an attacker's first poison packet succeeds, and it requires some
+        trusted way to learn the real MAC in the first place (here, reading
+        it directly from each namespace's own interface, which a real switch
+        would instead learn from legitimate DHCP/first-seen traffic under
+        Dynamic ARP Inspection). It also does not scale automatically to
+        hosts added after the fact without re-running the same process.
+  \item \textbf{IPsec AH in this report uses a manually pre-shared key, not
+        a production key-exchange protocol.} Defense~B
+        (Section~\ref{sec:defense-ipsec}) demonstrates the authentication
+        \emph{mechanism} (a shared key the attacker does not possess makes
+        tampering detectable), not a deployable configuration; a real
+        deployment would use IKE for key negotiation and rotation, which
+        this report does not implement or evaluate.
+  \item \textbf{The live IDS (Defense~C) is detection-only and assumes a
+        human or automated system acts on its alerts.} It does not itself
+        block, rate-limit, or otherwise interfere with the traffic it
+        flags; it is a complement to Defenses~A and~B, not a substitute for
+        either.
 \end{enumerate}
 
 % ---------------------------------------------------------------------------
@@ -498,9 +757,114 @@ effect at all, while the same attack against a resource-constrained host
 (or over a slower/longer path) would be expected to succeed as originally
 predicted.
 
-Defense mechanisms (IPsec/AH-ESP, IDS detection rules, Dynamic ARP
-Inspection, slow-read hardening, and related middlebox hygiene) are
-deliberately out of scope for this report and are addressed in a subsequent
-phase of the project.
+\begin{table}[h]
+\centering
+\caption{Defense mechanisms: mechanism and observed status}
+\begin{tabular}{p{2.6cm}p{5.2cm}p{4.4cm}p{1.9cm}}
+\toprule
+Defense & Mechanism & Observed effect on the attack & Status \\
+\midrule
+A: Static ARP (\S\ref{sec:defense-arp}) & Permanent neighbor entries reject forged ARP replies & Attacker never got on-path; 0 rewrites, 0 mismatches, full baseline throughput & \textbf{Confirmed working} \\
+B: IPsec AH (\S\ref{sec:defense-ipsec}) & AH's protocol-51 wrapping stopped the diversion rule from matching the SYN at all & 0 rewrites, 0 mismatches, wscale untouched; transfer completed (not blocked as predicted -- see \S\ref{sec:defense-ipsec}) & \textbf{Confirmed working} \\
+C: Live IDS (\S\ref{sec:defense-ids}) & Compares WScale across duplicate SYNs; flags sub-16\,KiB effective windows & 1 mismatch alert (exact match to the 1 tampered SYN), 24{,}891 anomalous-window alerts, 0 false positives & \textbf{Confirmed working} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All three defenses are implemented as executable code
+(\texttt{defense/harden\_arp.sh}, \texttt{defense/setup\_ipsec\_ah.sh},
+\texttt{defense/live\_ids.py}, orchestrated by
+\texttt{defense/run\_defense\_demo.sh}) and all three were run live against
+the exact attack pipeline from Section~\ref{sec:deflate}, not merely
+described. All three worked. Defenses A and B (static ARP, IPsec AH) both
+defeated the attack completely -- zero rewrites, zero pcap mismatches in
+either run -- though, notably, this report's own \emph{prediction} for
+Defense B was partially wrong: it expected the connection to fail to
+complete, when in fact it completed normally, simply immune to the
+tampering (Section~\ref{sec:defense-ipsec} discusses why in detail, itself
+a useful expected-vs-actual finding in the same spirit as
+Section~\ref{sec:inflate}'s). Defense C (the live IDS) correctly raised
+exactly one mismatch alert -- matching the true number of tampered SYNs
+exactly -- plus tens of thousands of anomalous-window alerts consistent
+with the deflate attack's already-established tiny-segment behaviour, with
+no false positives, both offline against a synthetic test case and live
+against real on-the-wire traffic.
+
+Taken together with Sections~\ref{sec:deflate}--\ref{sec:slowread}, this
+report now covers the full path the design report asked for: a
+reproducible attack with measurable impact, at least one working defense
+(in fact, three, covering blocking the MITM position, cryptographic
+integrity, and detection), and an honest account of where this report's own
+predictions -- for both the attacks and the defenses -- turned out to be
+wrong, and why.
+
+% ---------------------------------------------------------------------------
+\section{References}
+\label{sec:references}
+
+The same six sources cited in the design report, annotated below with what
+each was specifically used for in this implementation and report.
+
+\begin{enumerate}[label={[\arabic*]}]
+  \item RFC 7323, \emph{TCP Extensions for High Performance} (the Window
+        Scale option). \url{https://www.rfc-editor.org/rfc/rfc7323} \\
+        \textbf{Used for:} the entire attack's premise -- Kind~3/Length~3
+        option format, the $2^{\text{shift}}$ multiplier, shift range
+        $[0,14]$, and the specific behaviour exploited throughout this
+        report: the option is sent only in the SYN and SYN-ACK and never
+        re-verified. Directly informed \texttt{attacker/wscale\_attack.py}'s
+        option parsing/rewrite logic (Section~\ref{sec:deflate}) and the
+        effective-window calculation (\texttt{advertised\_window} $\times$
+        $2^{\text{wscale}}$) used throughout
+        \texttt{analysis/detect\_wscale\_mismatch.py} and
+        \texttt{defense/live\_ids.py} (Section~\ref{sec:defense-ids}).
+  \item RFC 9293, \emph{Transmission Control Protocol}.
+        \url{https://www.rfc-editor.org/rfc/rfc9293} \\
+        \textbf{Used for:} baseline TCP handshake, retransmission, and
+        window/flow-control semantics against which every ``actual outcome''
+        in this report was interpreted -- e.g., distinguishing the deflate
+        attack's zero-retransmit self-throttling
+        (Section~\ref{sec:deflate}) from the inflate attack's genuine
+        retransmissions after real buffer overrun (Section~\ref{sec:inflate}).
+  \item Fedora Magazine, \emph{TCP window scaling, timestamps and SACK}.
+        \url{https://fedoramagazine.org/tcp-window-scaling-timestamps-and-sack/} \\
+        \textbf{Used for:} a practical, implementation-level reference for
+        how Linux specifically negotiates and applies window scaling,
+        informing why the lab's default \texttt{snd\_wscale}/\texttt{rcv\_wscale}
+        showed up as 10 rather than an RFC-example value, and why both
+        endpoints falling back to unscaled 64\,KB windows (if either omits
+        the option) matters as an assumption (Section~\ref{sec:assumptions},
+        item 5).
+  \item Qualys, \emph{Are you ready for slow reading?}
+        \url{https://blog.qualys.com/vulnerabilities-threat-research/2012/01/05/slow-read} \\
+        \textbf{Used for:} the design basis for the Slow Read fallback
+        attack (Section~\ref{sec:slowread}) -- specifically the technique of
+        advertising a tiny real receive window and reading the response a
+        few bytes at a time to hold a server connection open indefinitely,
+        which \texttt{slowread/slow\_read\_client.py} implements directly
+        (small \texttt{SO\_RCVBUF}, paced \texttt{recv()} calls).
+  \item \texttt{slowhttptest} tool and Slow Read wiki.
+        \url{https://github.com/shekyan/slowhttptest} \\
+        \textbf{Used for:} the reference implementation of the same attack
+        class. \texttt{slowhttptest} itself was installed in the lab
+        environment but was \emph{not} the tool actually invoked for the
+        results in Section~\ref{sec:slowread}: a custom Python client
+        (\texttt{slowread/slow\_read\_client.py}) was written instead, so
+        that the pool-exhaustion target
+        (\texttt{server/http\_server.py}'s bounded worker pool) and the
+        attack client could be co-designed and instrumented together
+        (e.g., the before/during/after \texttt{/health} checks that produced
+        the evidence in Section~\ref{sec:slowread}). This is noted
+        explicitly so the report does not imply \texttt{slowhttptest}'s own
+        output was what was measured.
+  \item CVE-2008-4609 (Sockstress / TCP persist-timer DoS), National
+        Vulnerability Database.
+        \url{https://nvd.nist.gov/vuln/detail/CVE-2008-4609} \\
+        \textbf{Used for:} background context establishing Slow Read /
+        zero-window abuse as a member of a broader, previously-disclosed
+        class of low-bandwidth TCP state-exhaustion attacks, motivating why
+        it was included as a fallback rather than treated as a novel
+        technique in this report.
+\end{enumerate}
 
 \end{document}

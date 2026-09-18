@@ -1,0 +1,2 @@
+2026-09-19 02:27:58,982 listening on NFQUEUE 0 (target=client-syn, new_shift=0) -- Ctrl+C to stop
+2026-09-19 02:28:01,751 rewrote WScale 10.0.0.1:40708 -> 10.0.0.2:9000  shift 10 -> 0
