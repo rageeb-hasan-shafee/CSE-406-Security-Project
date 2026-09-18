@@ -1,0 +1,14 @@
+{
+  "role": "client",
+  "peer": "10.0.0.2:9000",
+  "bytes_received": 20971520,
+  "requested_size": 20971520,
+  "elapsed_s": 8.899,
+  "throughput_MBps": 2.357,
+  "retransmits": 0,
+  "total_retrans": 0,
+  "snd_cwnd": 10,
+  "rtt_us": 1059,
+  "snd_wscale": 10,
+  "rcv_wscale": 10
+}

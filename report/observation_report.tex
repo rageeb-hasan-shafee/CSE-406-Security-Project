@@ -1,0 +1,506 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{parskip}
+
+\definecolor{codebg}{rgb}{0.96,0.96,0.96}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  showstringspaces=false
+}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue
+}
+
+\title{TCP Window Scaling Attack \\ \large Implementation and Observation Report}
+\author{Hillol}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report documents the implementation and live execution of a TCP Window
+Scale desynchronization attack against a controlled 3-node lab, together with
+its low-bandwidth fallback (Slow Read / zero-window abuse). For each of the
+three attacks demonstrated -- \emph{deflate} (shift $7\to0$ family),
+\emph{inflate} (shift $\to14$), and \emph{Slow Read DoS} -- this report states
+the attack process actually followed, the outcome that was expected going in,
+the outcome that was actually observed, an explanation wherever the two
+diverged, and the assumptions the attack and the lab depend on. Defense
+mechanisms are explicitly out of scope for this report and are deferred to a
+subsequent phase of the project.
+\end{abstract}
+
+\tableofcontents
+
+% ---------------------------------------------------------------------------
+\section{Introduction}
+
+TCP's Window Scale option (RFC~7323) multiplies the 16-bit advertised receive
+window by $2^{\text{shift}}$, where shift $\in [0,14]$. Critically, the shift
+value is negotiated \emph{only} once, inside the SYN and SYN-ACK of the initial
+three-way handshake, and is never re-advertised or re-verified for the
+lifetime of the connection. An on-path attacker who can rewrite that single
+option byte in the SYN -- without touching anything else in the packet -- can
+make the two endpoints permanently disagree about how large the peer's
+receive window really is. This report covers the practical implementation of
+that idea and two attack variants built on it, executed against a live lab
+built for this project, along with a low-bandwidth fallback attack (Slow
+Read) that achieves a similar denial-of-service outcome through a different
+mechanism (a deliberately tiny \emph{real} window rather than a
+\emph{misread} one).
+
+Three attacks are covered:
+\begin{enumerate}
+  \item \textbf{Deflate}: the attacker rewrites the client's advertised shift
+        \emph{downward} (observed as $10\to0$), so the server believes the
+        client's window is far smaller than it really is.
+  \item \textbf{Inflate}: the attacker rewrites the client's advertised shift
+        \emph{upward} (observed as $10\to14$, and later $1\to14$), so the
+        server believes the client's window is far larger than it really is.
+  \item \textbf{Slow Read / zero-window DoS} (fallback): no packet tampering
+        at all -- many connections are opened and read a few bytes at a time
+        with a tiny real receive buffer, tying up the server's connection
+        pool.
+\end{enumerate}
+
+% ---------------------------------------------------------------------------
+\section{Lab Environment}
+\label{sec:lab}
+
+All three attacks were executed against a self-contained lab built from
+Linux network namespaces (standing in for the deck's ``3 VMs'') connected by
+a single Linux bridge acting as the shared switch:
+
+\begin{lstlisting}
+[client netns 10.0.0.1] --veth--\
+                                  wscale-br0 (bridge/"Switch") --veth-- [attacker netns 10.0.0.3]
+[server netns 10.0.0.2] --veth--/
+\end{lstlisting}
+
+\begin{itemize}
+  \item \textbf{Client} (\texttt{10.0.0.1}) and \textbf{Server}
+        (\texttt{10.0.0.2}) are ordinary TCP endpoints with no awareness of
+        the attacker.
+  \item \textbf{Attacker} (\texttt{10.0.0.3}) is a single-homed Linux host on
+        the same broadcast segment, running: \texttt{arp\_spoof.py} (ARP
+        poisoning), an \texttt{iptables} \texttt{NFQUEUE} divert rule, and
+        \texttt{wscale\_attack.py} (the packet rewrite, via
+        \texttt{scapy} + \texttt{NetfilterQueue}).
+  \item Throughput and TCP-level impact were measured directly from the
+        kernel's \texttt{TCP\_INFO} socket option (retransmits, congestion
+        window, RTT, negotiated window scale) rather than relying on
+        \texttt{iperf3}, giving byte-for-byte agreement between what each
+        endpoint believed and what was measured.
+  \item All traffic between client and server was also captured on the
+        bridge with \texttt{tcpdump} and inspected both with a custom
+        detector script (\texttt{analysis/detect\_wscale\_mismatch.py}) and
+        manually in Wireshark.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Attack 1: Deflate (Window Scale Downgrade)}
+\label{sec:deflate}
+
+\subsection{Attack Process}
+\begin{enumerate}
+  \item \textbf{Baseline capture.} A clean 20\,MB transfer between client and
+        server was captured and measured with no attacker on-path, to have a
+        reference point.
+  \item \textbf{Gain MITM.} \texttt{arp\_spoof.py} sent periodic forged ARP
+        replies telling the client ``the server is at the attacker's MAC''
+        and the server ``the client is at the attacker's MAC.'' With IP
+        forwarding enabled on the attacker and no route back out a second
+        interface (single NIC), the kernel naturally re-ARPs and relays
+        traffic back out the same interface to the real peer once it decides
+        to forward it -- the classic single-host ARP-spoofing MITM.
+  \item \textbf{Divert.} An \texttt{iptables} rule in the attacker's mangle
+        \texttt{FORWARD} chain sent every SYN/SYN-ACK (matched on the SYN
+        flag bit alone, so both directions qualify) to \texttt{NFQUEUE}
+        queue 0:
+\begin{lstlisting}
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN SYN \
+    -j NFQUEUE --queue-num 0 --queue-bypass
+\end{lstlisting}
+  \item \textbf{Rewrite.} \texttt{wscale\_attack.py}, bound to that queue,
+        inspected each queued packet, and -- restricting itself to the
+        client's \emph{plain} SYN only (\texttt{--target client-syn}, matching
+        the deck's timing diagram) -- located the \texttt{WScale} TCP option
+        and overwrote its single shift byte from the client's real value to
+        \texttt{0}. Both the TCP and IP checksums were deleted so
+        \texttt{scapy} recomputed them on serialization; nothing else in the
+        packet (length, sequence number, addresses) was touched, so no
+        re-segmentation was necessary.
+  \item \textbf{Measure.} A 20\,MB bulk transfer was run again, this time
+        with the MITM and rewrite active, and its \texttt{TCP\_INFO} and
+        wall-clock throughput were compared against the baseline.
+  \item \textbf{Verify.} The bridge-side pcap was run through
+        \texttt{detect\_wscale\_mismatch.py} and inspected in Wireshark for
+        the tell-tale duplicate SYN.
+\end{enumerate}
+
+\subsection{Expected Outcome}
+Per the design report: the server ends up believing the client's window is
+$2^{\text{real shift}}$ times smaller than it actually is. Since the
+client's real shift was 10, a rewrite to shift 0 means the server
+under-estimates the client's window by a factor of $2^{10}=1024$. The server
+should then throttle its sending to what it believes is the client's tiny
+real capacity, and throughput should collapse toward the pre-scaling 64\,KB
+regime -- visible as a large, sustained drop in throughput with no actual
+packet loss (this is a \emph{self-throttling}, not a \emph{loss-driven}
+degradation).
+
+\subsection{Actual Outcome}
+The rewrite was confirmed in the attacker's own log:
+\begin{lstlisting}
+2026-09-19 00:20:48,239 listening on NFQUEUE 0 (target=client-syn, new_shift=0)
+2026-09-19 00:20:50,989 rewrote WScale 10.0.0.1:44992 -> 10.0.0.2:9000  shift 10 -> 0
+\end{lstlisting}
+
+\begin{table}[h]
+\centering
+\caption{Deflate attack: baseline vs.\ attack, measured via \texttt{TCP\_INFO}}
+\begin{tabular}{lrrrr}
+\toprule
+Run & Throughput (MB/s) & \texttt{total\_retrans} & RTT ($\mu$s) & Server's belief (\texttt{snd\_wscale}) \\
+\midrule
+Baseline & 1781.163 & 0 & 360 & 10 (correct) \\
+Attack (deflate) & 2.314 & 0 & 9 & 0 (wrong; real is 10) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent This is a \textbf{99.9\% throughput drop}, with \emph{zero}
+retransmissions -- confirming the collapse is pure self-throttling by the
+server based on a wrong belief, not packet loss. The bridge-side capture
+showed the predicted duplicate SYN:
+\begin{lstlisting}
+10.0.0.1:44992 -> 10.0.0.2:9000  seq=2098777608  [SYN]
+    wscale values seen: [0, 10]  <-- MISMATCH (tampered in flight)
+10.0.0.2:9000 -> 10.0.0.1:44992  seq=389760085  [SYN-ACK]
+    wscale values seen: [10]
+
+996 anomalously small effective windows (< 16 KiB) on data packets,
+almost all at exactly 63 bytes effective window.
+\end{lstlisting}
+In Wireshark, the two SYN frames with identical IP addresses and sequence
+number but different source MAC addresses (client's real MAC for the first,
+attacker's MAC for the re-injected second) are visible a frame or two apart,
+each with a different value in \emph{TCP $\to$ Options $\to$ Window Scale}.
+
+\subsection{Discrepancies and Explanation}
+The core prediction (large throughput collapse, mismatch visible, small
+effective windows) matched expectation exactly and needed no correction.
+Two things were observed that the design report did not explicitly call
+out, and are worth recording:
+
+\begin{enumerate}
+  \item \textbf{Packet volume.} An early, uncapped capture of this same
+        scenario recorded \textbf{over 1.3 million packets} for a single
+        20\,MB transfer -- far more than a normal transfer would ever
+        produce. This is fully explained, not a bug: with an effective
+        window collapsed to $\sim\!63$ bytes, moving 20\,MB requires
+        roughly $20{,}971{,}520 / 63 \approx 333{,}000$ data segments, each
+        needing its own ACK before the next can be sent, and \emph{each of
+        those frames crosses the bridge twice} because of the two-hop MITM
+        path (client$\to$attacker, then attacker$\to$server, as two distinct
+        Ethernet frames sharing the same IP 5-tuple). $333{,}000 \times 2
+        \text{ (data+ack)} \times 2 \text{ (hops)} \approx 1{,}332{,}000$,
+        which matches the observed count almost exactly. This is a
+        genuine, if unstated, consequence of a successful deflate attack:
+        it is not merely slow, it is also extremely ``chatty.''
+  \item \textbf{Congestion window behaviour.} \texttt{snd\_cwnd} stayed at
+        its initial value (10 segments) for the entire transfer rather than
+        growing via slow start. This is consistent with the connection being
+        \emph{receive-window-limited} rather than congestion-limited: the
+        server's window ceiling is far below what would be needed to
+        exercise congestion control at all, so cwnd growth (which requires
+        filling the current window) never has an opportunity to trigger.
+\end{enumerate}
+
+% ---------------------------------------------------------------------------
+\section{Attack 2: Inflate (Window Scale Overstatement)}
+\label{sec:inflate}
+
+\subsection{Attack Process}
+Identical pipeline to Section~\ref{sec:deflate}, except
+\texttt{wscale\_attack.py} was run with \texttt{--new-shift 14} instead of
+\texttt{0}, so the client's real shift is rewritten \emph{upward} rather than
+downward. In addition, after the first attempt (below) failed to show any
+effect, the process was revised to also pin the client's \emph{real} socket
+receive buffer to a fixed, small size before connecting
+(\texttt{throughput/bulk\_client.py --rcvbuf 65536}), which disables Linux's
+automatic receive-buffer growth for that socket.
+
+\subsection{Expected Outcome}
+The server should believe the client's window is $2^{14-\text{real shift}}$
+times \emph{larger} than it actually is. Data that the server believes fits
+inside the client's window can therefore exceed the client's \emph{real}
+buffer capacity; bytes that arrive beyond what the client can actually
+buffer are dropped at the receiver, forcing the sender into retransmissions
+-- i.e., a retransmission storm and/or stalls, rather than the pure collapse
+seen in the deflate case.
+
+\subsection{Actual Outcome}
+\paragraph{First attempt (no pinned receive buffer).} The rewrite was
+confirmed (\texttt{shift 10 -> 14}, server's \texttt{snd\_wscale} became
+14), but the measured result \emph{diverged from the prediction}: throughput
+\emph{increased} slightly (1176.326 $\to$ 2480.288 MB/s) and
+\texttt{total\_retrans} stayed at \textbf{0} -- no visible damage at all.
+
+\paragraph{Second attempt (client receive buffer pinned to 65536 bytes).}
+With the real buffer fixed and small, the predicted effect appeared clearly
+and grew more pronounced across repeated runs against the same peer:
+
+\begin{table}[h]
+\centering
+\caption{Inflate attack, with pinned client receive buffer: three successive runs}
+\begin{tabular}{lrrrrl}
+\toprule
+Run & Throughput (MB/s) & \texttt{total\_retrans} & \texttt{snd\_cwnd} & Rewrite & Real shift seen \\
+\midrule
+1st & 47.354 & 306 & 156 & $10\to14$ & 10 \\
+2nd & 22.747 & 1065 & 121 & $10\to14$ & 10 \\
+3rd & 13.535 & 1398 & 167 & $1\to14$ & \textbf{1} (see below) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+In the third run, the pcap-level detector reported an even more extreme
+result:
+\begin{lstlisting}
+10.0.0.1:59258 -> 10.0.0.2:9000  seq=20094852  [SYN]
+    wscale values seen: [1, 14]  <-- MISMATCH (tampered in flight)
+
+Anomalously small effective windows (< 16 KiB) on data packets:
+  advertised_window=0  wscale=14  effective=0 bytes   (x4)
+\end{lstlisting}
+
+\subsection{Discrepancies and Explanation}
+Two distinct divergences from the design report's prediction were observed
+and are worth documenting in detail:
+
+\begin{enumerate}
+  \item \textbf{No effect at all on the first attempt.} The rewrite
+        \emph{did} happen (confirmed in the log and in
+        \texttt{TCP\_INFO}), but no retransmissions occurred and throughput
+        was unaffected (indeed slightly higher). \textbf{Cause:} on this
+        lab's fast, effectively zero-RTT loopback-speed link, Linux's
+        receive-buffer autotuning grows the client's real socket buffer to
+        several megabytes very quickly, and the whole 20\,MB transfer
+        completed in well under a second. There was neither enough time nor
+        enough bytes-in-flight for the server's inflated belief to ever
+        actually exceed the client's (auto-grown, generous) real buffer.
+        The attack was correctly executed but the \emph{lab conditions}
+        (unrealistically fast, low-latency link; short transfer) hid its
+        consequence. This was corrected by explicitly pinning the client's
+        real receive buffer to a small, fixed value with \texttt{SO\_RCVBUF},
+        which disables the autotuning and gives the server's false belief an
+        actual, fixed ceiling to overrun -- after which the predicted
+        retransmissions appeared immediately.
+  \item \textbf{The real shift value changed between runs, unprompted
+        ($10\to1$).} The design report implicitly assumes the client's real
+        window-scale shift is fixed and known; in practice, across repeated
+        test connections between the \emph{same} two IP addresses, the
+        Linux kernel's per-destination TCP metrics cache remembered
+        parameters (such as effective window/RTT behaviour) from the
+        earlier, artificially degraded connections and used them to pick a
+        smaller initial window scale for a later, brand-new connection. This
+        is a real Linux TCP stack behaviour, not an attack artifact, but it
+        meaningfully changed the attack's effective multiplier from
+        $2^{14-10}=16\times$ to $2^{14-1}=8192\times$ between runs, and is
+        the direct cause of the escalating \texttt{total\_retrans} (306
+        $\to$ 1065 $\to$ 1398) and the eventual observed \emph{zero}
+        effective window across three otherwise-identical repetitions of
+        the same command.
+\end{enumerate}
+
+% ---------------------------------------------------------------------------
+\section{Attack 3 (Fallback): Slow Read / Zero-Window DoS}
+\label{sec:slowread}
+
+\subsection{Attack Process}
+This attack does not tamper with any packet. A target HTTP server
+(\texttt{server/http\_server.py}) was started with a bounded worker pool
+(\texttt{--max-conns 20}), serving a large resource at \texttt{/bigfile} and
+a fast \texttt{/health} endpoint. The attack client
+(\texttt{slowread/slow\_read\_client.py}) opened 50 concurrent connections,
+each requesting \texttt{/bigfile}, each with its socket's
+\texttt{SO\_RCVBUF} pinned to 8 bytes, and each reading only a few bytes
+every second for 30 seconds. Because the client's real advertised window is
+genuinely tiny, the server's \texttt{send()} calls block waiting for TCP
+flow control to allow more data through, tying up one worker thread per
+connection for the full 30 seconds. \texttt{/health} was polled before,
+during, and after the attack to observe the server's availability to a
+legitimate client.
+
+\subsection{Expected Outcome}
+With 50 slow connections against a 20-connection pool, the pool should be
+exhausted, and legitimate requests (the \texttt{/health} check) should be
+denied or stall for as long as the attack connections are held open; the
+server should recover immediately once those connections close.
+
+\subsection{Actual Outcome}
+The outcome matched the prediction exactly:
+\begin{lstlisting}
+[*] baseline health check on 10.0.0.2:8000 before the attack...
+    -> ok=True rtt=0.001s
+
+[*] health check WHILE the slow-read attack is running...
+    -> ok=False rtt=3.000s body='[Errno 104] Connection reset by peer'
+       <-- DENIED / degraded, pool likely exhausted
+
+[*] summary: 20/50 connections held open for the full duration.
+
+[*] health check AFTER attacker connections released...
+    -> ok=True rtt=0.001s
+\end{lstlisting}
+Exactly 20 of the 50 attack connections were held open for the full 30
+seconds -- matching the pool size precisely -- while the remaining 30 were
+rejected outright once the pool filled (visible in the server's own log as
+repeated \texttt{pool exhausted (20 active) -- rejecting ...} lines) or
+reset shortly after. The health check was denied only during the attack
+window and recovered to sub-millisecond response time immediately
+afterward.
+
+\subsection{Discrepancies and Explanation}
+No discrepancy was observed for this attack; the outcome matched the
+expected mechanism exactly on the first run. This is consistent with the
+design report's own framing of Slow Read as the ``guaranteed-working
+backup'' -- unlike the window-scale attacks, it does not depend on any
+kernel-level buffer-autotuning behaviour or on the two endpoints having a
+particular history with each other, only on the server having a finite
+worker/connection pool, which is a very common and simple property of real
+servers.
+
+% ---------------------------------------------------------------------------
+\section{Assumptions}
+\label{sec:assumptions}
+
+The following assumptions underlie the attacks demonstrated in this report,
+either because the attack's design depends on them or because the lab's
+construction depends on them:
+
+\begin{enumerate}
+  \item \textbf{On-path position.} The attacker is already able to reach
+        the same broadcast/Layer-2 segment as both the client and the
+        server (no VLAN separation, no port isolation, no switch-level
+        protections such as Dynamic ARP Inspection or 802.1X). This is the
+        standard precondition for ARP spoofing and is assumed to already be
+        satisfied, not obtained by some other exploit.
+  \item \textbf{No transport/network-layer integrity protection.} Neither
+        endpoint uses IPsec (AH/ESP) or any other mechanism that would
+        authenticate the TCP header. TLS is explicitly \emph{not} a
+        counter-measure here, since TLS protects only the application
+        payload and never the TCP header the Window Scale option lives in.
+  \item \textbf{Single-homed attacker relying on kernel forwarding.} The
+        attacker has one network interface, not two; it relies on IP
+        forwarding plus its own (unpoisoned) ARP resolution of the real peer
+        to relay traffic back out the same interface, rather than bridging
+        two separate physical links. This is the classic ``Ettercap-style''
+        single-NIC MITM, and it is why the same logical packet is observed
+        twice on the shared bridge (Section~\ref{sec:deflate}).
+  \item \textbf{Window Scale is negotiated once and never re-verified.} The
+        entire premise of Attacks 1 and 2 depends on the RFC~7323 behaviour
+        that the shift value is fixed for the life of the connection after
+        the handshake. If either endpoint's TCP stack ever re-advertised or
+        re-validated the scale mid-connection, the desync would be
+        self-correcting.
+  \item \textbf{Both endpoints request window scaling.} If either side
+        omits the \texttt{WScale} option from its SYN, both sides fall back
+        to the unscaled 64\,KB window and there is no scale value left for
+        the attacker to tamper with.
+  \item \textbf{Endpoint TCP-stack behaviour is not fixed or fully
+        predictable.} The original attack narrative implicitly treats the
+        client's real window scale, and the visibility of an inflate
+        attack's damage, as fixed quantities. In practice, Linux's
+        receive-buffer autotuning and per-destination TCP metrics caching
+        both meaningfully changed what was observed between otherwise
+        identical runs (Section~\ref{sec:inflate}). Any claim of ``expected
+        outcome'' for the inflate attack specifically should be understood
+        as conditional on the receiving buffer actually being smaller than
+        what the false window implies -- which is not guaranteed by the
+        attack alone and had to be engineered explicitly in this lab via
+        \texttt{SO\_RCVBUF}.
+  \item \textbf{Lab timing is not representative of a real WAN.} The lab
+        uses Linux network namespaces and a software bridge on one physical
+        machine, giving near-zero RTT and very high effective bandwidth
+        compared to a real network. This suppresses some effects (the
+        inflate attack's overrun needed to be engineered around it) and
+        exaggerates others (the deflate attack's packet-count explosion is
+        partly a function of how fast one machine can loop packets to
+        itself). The \emph{direction} of every observed effect should
+        generalize to a real network; the specific magnitudes and timings
+        should not be assumed to transfer directly.
+  \item \textbf{Only the client's SYN is tampered, by design.} All three
+        attacks target the client's plain SYN specifically
+        (\texttt{--target client-syn}), matching the deck's own timing
+        diagram, and leave the SYN-ACK untouched. The implementation also
+        supports tampering the SYN-ACK or both packets
+        (\texttt{--target server-synack}\,/\,\texttt{both}), but those
+        configurations were not the ones demonstrated in this report.
+  \item \textbf{The Slow Read fallback assumes a bounded server resource.}
+        Attack 3 assumes the target server has some finite, exhaustible
+        resource gated per-connection (here, a fixed-size worker thread
+        pool). A server architecture without such a bound (e.g., a
+        fully event-driven server with no per-connection worker limit)
+        would not be denied service by this specific mechanism, though it
+        may still suffer memory pressure from enough held-open connections.
+\end{enumerate}
+
+% ---------------------------------------------------------------------------
+\section{Summary}
+\label{sec:summary}
+
+\begin{table}[h]
+\centering
+\caption{Overall summary: expected vs.\ actual, all three attacks}
+\begin{tabular}{p{2.7cm}p{4.3cm}p{4.3cm}p{2.6cm}}
+\toprule
+Attack & Expected & Actual & Matched? \\
+\midrule
+Deflate ($10\to0$) & Large throughput collapse, no packet loss & 99.9\% throughput drop, 0 retransmits, mismatch \& anomalous windows confirmed & Yes, exactly \\
+Inflate ($\to14$), no pinned buffer & Retransmission storm / drops & No effect (throughput \emph{rose}, 0 retransmits) & No -- lab autotuning masked it \\
+Inflate ($\to14$), pinned buffer & Retransmission storm / drops & 306--1398 retransmits across repeated runs, escalating & Yes, once corrected \\
+Slow Read DoS & Pool exhaustion, legitimate requests denied & 20/50 connections held (exact match to pool size), \texttt{/health} denied during attack, recovered after & Yes, exactly \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two of the three attacks (Deflate and Slow Read) matched their predicted
+outcome on the first properly-executed attempt, with strong, unambiguous
+evidence at both the socket level (\texttt{TCP\_INFO}) and the packet level
+(pcap mismatch and anomalous-window detection). The Inflate attack required
+one methodological correction -- explicitly pinning the client's real
+receive buffer -- before its predicted failure mode (retransmission storm)
+became observable, because the lab's fast, low-latency link let Linux's
+normal receive-buffer autotuning hide the effect that a slower or more
+resource-constrained real-world host would not have hidden. This divergence
+and its resolution are documented in Section~\ref{sec:inflate} and are, in
+themselves, a useful finding: an attacker relying solely on the ``inflate''
+variant against a well-provisioned, high-bandwidth host may see no visible
+effect at all, while the same attack against a resource-constrained host
+(or over a slower/longer path) would be expected to succeed as originally
+predicted.
+
+Defense mechanisms (IPsec/AH-ESP, IDS detection rules, Dynamic ARP
+Inspection, slow-read hardening, and related middlebox hygiene) are
+deliberately out of scope for this report and are addressed in a subsequent
+phase of the project.
+
+\end{document}

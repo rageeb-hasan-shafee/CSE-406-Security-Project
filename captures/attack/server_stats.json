@@ -1,0 +1,14 @@
+{
+  "role": "server",
+  "peer": "10.0.0.1:33436",
+  "bytes_sent": 20971520,
+  "requested_size": 20971520,
+  "elapsed_s": 8.897,
+  "throughput_MBps": 2.357,
+  "retransmits": 0,
+  "total_retrans": 0,
+  "snd_cwnd": 10,
+  "rtt_us": 9,
+  "snd_wscale": 0,
+  "rcv_wscale": 10
+}
